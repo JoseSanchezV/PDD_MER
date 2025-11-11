@@ -1,0 +1,239 @@
+import pandas as pd
+from openpyxl import load_workbook, Workbook
+import os
+import datetime
+import shutil
+from pathlib import Path
+from typing import Optional
+import numpy as np 
+
+# --- CONSTANTES ---
+NOMBRE_CSV = 'Cotas Actualizadas.csv'
+COLUMNA_CLAVE_POT_HIDRO = 'A' 
+COLUMNA_POTENCIA_ORIGEN = 'H' 
+NUM_FILAS_DESTINO = 24       
+COL_KEY_IDX = 0
+COL_POTENCIA_IDX = 7
+MIN_COLS_REQUIRED = COL_POTENCIA_IDX + 1 
+
+# 🟢 FIRMA CONSISTENTE: Adaptada a la llamada de principal.py
+def actualizar_hoja_peh(
+    data_path_comun: str, 
+    archivo_principal_path: str, 
+    ruta_salida_dat: str,   # No se usa, pero es necesario para la firma
+    dest_date: str,         # Fecha de entrada (s_fecha_str_input)
+    ldm_file_path: str      # No se usa, pero es necesario para la firma
+) -> bool:
+    """
+    Lógica principal para actualizar la potencia hidroeléctrica en la hoja PEH,
+    con una firma compatible con la llamada principal.py.
+    """
+    print("\n--- 1. Ejecutando Módulo: Actualización de Potencia Hidro ---")
+    
+    try:
+        # 1. Mapeo de argumentos a la lógica interna (Simplificado)
+        s_ruta_comun = data_path_comun
+        s_fecha_str_input = dest_date 
+        
+        # 2. Verificación y Normalización de Rutas
+        if not s_ruta_comun or not archivo_principal_path:
+            raise ValueError("Las rutas no pueden estar vacías.")
+            
+        s_ruta_comun = s_ruta_comun.replace("/", os.sep).replace("\\", os.sep)
+        archivo_principal_path = archivo_principal_path.replace("/", os.sep).replace("\\", os.sep)
+        s_cot_path = os.path.join(s_ruta_comun, NOMBRE_CSV)
+        
+        if not os.path.exists(s_cot_path):
+            raise FileNotFoundError(f"NO SE ENCUENTRA EL ARCHIVO {NOMBRE_CSV} en la ruta: {s_cot_path}")
+        if not os.path.exists(archivo_principal_path):
+            raise FileNotFoundError(f"NO SE ENCUENTRA EL ARCHIVO PRINCIPAL en la ruta: {archivo_principal_path}")
+            
+        # 3. Extracción de la fecha 
+        s_fecha_str = ""
+        try:
+            if '/' in s_fecha_str_input:
+                partes = s_fecha_str_input.split('/')[0]
+            else:
+                partes = s_fecha_str_input.split()[0]
+            
+            s_fecha_str = str(partes).zfill(2)
+            print(f"   > Buscando el día: {s_fecha_str} (extraído de {s_fecha_str_input})")
+
+        except Exception as e:
+            s_fecha_str = str(s_fecha_str_input).split('/')[0].zfill(2)
+            print(f"   > ADVERTENCIA: Error al analizar la fecha ({e}). Usando el día: {s_fecha_str}")
+        
+        if not s_fecha_str.isdigit() or len(s_fecha_str) != 2:
+            raise ValueError("No se pudo extraer un día válido (DD) para la búsqueda de la fecha.")
+
+
+        # 4. Carga y Procesamiento de Excel/CSV
+        
+        # 4.1 Cargar el CSV e importarlo a POT_HIDRO
+        df_cot = pd.read_csv(s_cot_path, header=None)
+        
+        print("   > Importando datos del CSV a la hoja POT_HIDRO...")
+        with pd.ExcelWriter(archivo_principal_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+            df_cot.to_excel(writer, sheet_name='POT_HIDRO', index=False, header=False)
+        
+        # 4.2 Recargar las hojas para la lógica de transferencia
+        wb = load_workbook(archivo_principal_path)
+        ws_peh = wb['PEH']
+
+        # 4.3 Encontrar la fila de destino en PEH (Columna A)
+        l_row_fecha_admin = None
+        for i, row in enumerate(ws_peh.iter_rows(min_col=1, max_col=1, min_row=1, values_only=True)):
+            if str(row[0]).strip() == s_fecha_str: 
+                l_row_fecha_admin = i + 1 
+                break
+
+        if l_row_fecha_admin is None:
+            raise ValueError(f"No se encontró la fecha de destino ('{s_fecha_str}') en la columna A de la hoja PEH.")
+
+        print(f"   > Fila de destino en PEH encontrada: {l_row_fecha_admin}")
+
+        # 4.4 Transferencia de Datos
+        
+        df_pot_hidro_full = pd.read_excel(
+            archivo_principal_path, 
+            sheet_name='POT_HIDRO', 
+            header=None, skiprows=1, 
+        )
+        
+        if df_pot_hidro_full.shape[1] < MIN_COLS_REQUIRED:
+            raise ValueError(f"La hoja 'POT_HIDRO' tiene solo {df_pot_hidro_full.shape[1]} columnas después de la importación. Se requiere un mínimo de {MIN_COLS_REQUIRED} (hasta la columna H) para extraer la potencia.")
+
+        df_pot_hidro = df_pot_hidro_full.iloc[:, [COL_KEY_IDX, COL_POTENCIA_IDX]].copy()
+        
+        df_pot_hidro.columns = ['Key', 'Potencia']
+        df_pot_hidro = df_pot_hidro.dropna(subset=['Key', 'Potencia'], how='all')
+        df_pot_hidro['Key'] = df_pot_hidro['Key'].astype(str).str.strip()
+        df_pot_hidro['Potencia'] = pd.to_numeric(df_pot_hidro['Potencia'], errors='coerce')
+
+        # Obtener mapeo de claves (Fila 1 de PEH)
+        df_peh_keys = pd.read_excel(archivo_principal_path, sheet_name='PEH', header=None, nrows=1)
+        peh_keys = df_peh_keys.iloc[0].astype(str).str.strip().tolist()
+        
+        key_to_col_index = {}
+        start_col_index = 6 
+        for col_index in range(start_col_index, len(peh_keys)):
+            key_to_col_index[peh_keys[col_index]] = col_index + 1 
+
+        # Iterar y escribir valores
+        unidades_actualizadas = 0
+        for index, row in df_pot_hidro.iterrows():
+            s_key = row['Key']
+            v_potencia = row['Potencia']
+            
+            if s_key in key_to_col_index and pd.notna(v_potencia):
+                l_col_fecha_admin = key_to_col_index[s_key]
+                v_potencia_num = v_potencia
+                
+                for row_num in range(l_row_fecha_admin, l_row_fecha_admin + NUM_FILAS_DESTINO):
+                    ws_peh.cell(row=row_num, column=l_col_fecha_admin, value=v_potencia_num)
+                
+                unidades_actualizadas += 1
+
+        # Guardar y notificar
+        wb.save(archivo_principal_path)
+        print(f"   > ✅ Transferencia completada. {unidades_actualizadas} unidades hidro actualizadas.")
+        print("--- ✅ Módulo Actualización de Potencia Hidro COMPLETADO ---")
+        return True
+
+    except Exception as e:
+        print(f"--- ❌ ERROR FATAL en Módulo Potencia Hidro: {e} ---")
+        return False
+
+# ---------------------------------------------------------------------------------------------------
+# 🧪 ÁREA DE PRUEBA: Simulación del entorno principal
+# ---------------------------------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    
+    print("Ejecutando la ÁREA DE PRUEBA de actualización de potencia hidro...")
+    
+    # 1. Definición de rutas y archivos
+    TEST_BASE_PATH = Path(os.path.dirname(os.path.abspath(__file__)))
+    TEST_DATA_DIR = TEST_BASE_PATH / "test_data_in_hidro"
+    
+    if TEST_DATA_DIR.exists():
+        shutil.rmtree(TEST_DATA_DIR)
+    TEST_DATA_DIR.mkdir(exist_ok=True)
+    
+    TEST_ARCHIVO_PRINCIPAL_PATH = str(TEST_DATA_DIR / "Data.xlsx")
+    TEST_CSV_PATH = str(TEST_DATA_DIR / NOMBRE_CSV)
+    
+    # 2. Creación de archivos de prueba
+    
+    # A) Cotas Actualizadas.csv (8 columnas requeridas para H)
+    csv_data = {
+        0: ['Clave1', 'Clave2', 'Clave3', 'Clave4'], # Columna A (Key)
+        1: [0, 0, 0, 0], 
+        2: [0, 0, 0, 0], 
+        3: [0, 0, 0, 0], 
+        4: [0, 0, 0, 0], 
+        5: [0, 0, 0, 0], 
+        6: [0, 0, 0, 0], 
+        7: [100.5, 200.0, 30.0, np.nan] # Columna H (Potencia: 3 valores válidos, 1 NaN)
+    }
+    pd.DataFrame(csv_data).to_csv(TEST_CSV_PATH, header=False, index=False)
+
+    # B) Data.xlsx (PEH)
+    try:
+        wb_test = Workbook()
+        wb_test.remove(wb_test.active)
+        ws_admin_test = wb_test.create_sheet('ADMIN')
+        wb_test.create_sheet('POT_HIDRO')
+        ws_peh_test = wb_test.create_sheet('PEH')
+        
+        peh_keys = ['A', 'B', 'C', 'D', 'E', 'F', 'Clave1', 'Clave3', 'Clave2', 'Clave_No_Existe']
+        for col_idx, key in enumerate(peh_keys):
+             ws_peh_test.cell(row=1, column=col_idx + 1, value=key)
+        
+        # Columna A (Días 01 a 31) - Se buscará el día 5
+        for row_idx in range(1, 32):
+            ws_peh_test.cell(row=row_idx, column=1, value=str(row_idx).zfill(2))
+            
+        wb_test.save(TEST_ARCHIVO_PRINCIPAL_PATH)
+
+    except Exception as e:
+        print(f"ERROR al crear el archivo de prueba: {e}")
+        exit()
+
+    # 3. Ejecutar la función principal (Simulando la llamada de principal.py)
+    
+    RUTA_BASE_NCP_PRUEBA = str(TEST_DATA_DIR) 
+    FECHA_INPUT_PRINCIPAL = "05/10/2025 - 12:00:00 AM" # Día 05
+    
+    try:
+        print("\n--- INICIO DE LA PRUEBA DE COMPATIBILIDAD ---")
+        
+        # 🟢 Llamada que simula la función en principal.py:
+        resultado = actualizar_hoja_peh(
+            data_path_comun=RUTA_BASE_NCP_PRUEBA, 
+            archivo_principal_path=TEST_ARCHIVO_PRINCIPAL_PATH, 
+            ruta_salida_dat=".", # Parámetro no usado
+            dest_date=FECHA_INPUT_PRINCIPAL, 
+            ldm_file_path="." # Parámetro no usado
+        )
+        
+        # 4. Verificación post-ejecución
+        if resultado:
+            wb_check = load_workbook(TEST_ARCHIVO_PRINCIPAL_PATH)
+            ws_peh_check = wb_check['PEH']
+            
+            fila_inicio = 5 
+            valor_clave1 = ws_peh_check.cell(row=fila_inicio, column=7).value
+            
+            print("\n--- VERIFICACIÓN DE DATOS ---")
+            print(f"Potencia Clave1 (G5) valor: {valor_clave1} (Esperado: 100.5)")
+            
+            if valor_clave1 == 100.5:
+                 print(f"✅ VERIFICACIÓN OK: La firma de la función es compatible y la lógica funciona.")
+            else:
+                 print(f"❌ VERIFICACIÓN FALLIDA: Valor inesperado.")
+        else:
+             print("\n❌ La prueba falló. Revise el ERROR FATAL anterior.")
+
+    except Exception as e:
+        print(f"\n❌ ERROR IRRECUPERABLE EN EL ÁREA DE PRUEBA: {e}")
