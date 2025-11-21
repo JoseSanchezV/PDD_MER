@@ -4,7 +4,7 @@ timeout /t 3 /nobreak > nul
 
 :: 1. Define los nombres de los archivos
 :: **ASEGURATE que OLD_EXE coincida con NOMBRE_EXE_PRINCIPAL en Python**
-set "OLD_EXE=nombre_de_tu_app.exe"
+set "OLD_EXE=PDD_MER.exe"
 :: **ASEGURATE que NEW_EXE coincida con NOMBRE_EXE_TEMPORAL en Python**
 set "NEW_EXE=app_new.exe"
 set "BAT_FILE=updater.bat"
